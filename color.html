@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI 衣着颜色识别</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .color-transition {
+            transition: background-color 0.8s ease, color 0.8s ease;
+        }
+        #video-container {
+            transform: scaleX(-1); /* 镜像显示摄像头 */
+        }
+        .pulse {
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+    </style>
+</head>
+<body class="bg-gray-900 text-white min-h-screen flex flex-col items-center p-4 color-transition" id="body-bg">
+    
+    <div class="max-w-4xl w-full space-y-6">
+        <!-- 标题栏 -->
+        <div class="text-center">
+            <h1 class="text-3xl font-bold mb-2">AI 视觉色彩同步</h1>
+            <p class="text-gray-400">摄像头将识别你衣服的颜色，并同步到页面背景</p>
+        </div>
+
+        <!-- 主界面 -->
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <!-- 左侧：摄像头预览 -->
+            <div class="relative bg-black rounded-2xl overflow-hidden shadow-2xl border-4 border-gray-700">
+                <video id="webcam" autoplay playsinline class="w-full h-auto"></video>
+                <canvas id="capture-canvas" class="hidden"></canvas>
+                <div id="loading-overlay" class="absolute inset-0 bg-black/60 flex items-center justify-center hidden">
+                    <div class="text-center">
+                        <div class="inline-block w-8 h-8 border-4 border-white border-t-transparent rounded-full animate-spin mb-2"></div>
+                        <p class="text-sm">正在分析色彩...</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 右侧：状态与识别结果 -->
+            <div class="bg-white/10 backdrop-blur-md rounded-2xl p-6 flex flex-col justify-between border border-white/20">
+                <div>
+                    <h2 class="text-xl font-semibold mb-4">识别状态</h2>
+                    <div id="status-badge" class="inline-flex items-center px-3 py-1 rounded-full text-xs font-medium bg-red-500/20 text-red-400 mb-6">
+                        <span class="w-2 h-2 bg-red-500 rounded-full mr-2"></span>
+                        未启动
+                    </div>
+                    
+                    <div class="space-y-4">
+                        <div>
+                            <p class="text-sm text-gray-400 uppercase tracking-wider">当前检测到的颜色</p>
+                            <p id="color-name" class="text-4xl font-black mt-1">等待中...</p>
+                        </div>
+                        <div>
+                            <p class="text-sm text-gray-400 uppercase tracking-wider">HEX 代码</p>
+                            <p id="color-hex" class="text-2xl font-mono text-gray-300">#------</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="mt-8 space-y-3">
+                    <button id="start-btn" class="w-full py-3 bg-blue-600 hover:bg-blue-700 rounded-xl font-bold transition-all transform active:scale-95">
+                        开启摄像头与识别
+                    </button>
+                    <p class="text-[10px] text-gray-500 text-center italic">
+                        提示：AI 每隔 5 秒会自动抓取画面进行分析。
+                    </p>
+                </div>
+            </div>
+        </div>
+
+        <!-- 底部说明 -->
+        <div id="error-box" class="hidden bg-red-900/50 border border-red-500 p-4 rounded-xl text-red-200 text-sm text-center">
+        </div>
+    </div>
+
+    <script>
+        const apiKey = ""; // 运行时环境将提供
+        const video = document.getElementById('webcam');
+        const canvas = document.getElementById('capture-canvas');
+        const bodyBg = document.getElementById('body-bg');
+        const startBtn = document.getElementById('start-btn');
+        const colorNameDisplay = document.getElementById('color-name');
+        const colorHexDisplay = document.getElementById('color-hex');
+        const statusBadge = document.getElementById('status-badge');
+        const loadingOverlay = document.getElementById('loading-overlay');
+        const errorBox = document.getElementById('error-box');
+
+        let isRunning = false;
+        let analysisInterval = null;
+
+        // 初始化摄像头
+        async function setupCamera() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { facingMode: 'user' }, 
+                    audio: false 
+                });
+                video.srcObject = stream;
+                return true;
+            } catch (err) {
+                showError("无法访问摄像头，请检查权限设置。");
+                return false;
+            }
+        }
+
+        // 显示错误信息
+        function showError(msg) {
+            errorBox.textContent = msg;
+            errorBox.classList.remove('hidden');
+            setTimeout(() => errorBox.classList.add('hidden'), 5000);
+        }
+
+        // 指数退避请求
+        async function fetchWithRetry(url, options, retries = 5, backoff = 1000) {
+            try {
+                const response = await fetch(url, options);
+                if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+                return await response.json();
+            } catch (err) {
+                if (retries <= 0) throw err;
+                await new Promise(resolve => setTimeout(resolve, backoff));
+                return fetchWithRetry(url, options, retries - 1, backoff * 2);
+            }
+        }
+
+        // 核心分析逻辑
+        async function analyzeColor() {
+            if (!isRunning) return;
+            
+            loadingOverlay.classList.remove('hidden');
+
+            // 1. 抓取当前帧
+            const context = canvas.getContext('2d');
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            context.drawImage(video, 0, 0, canvas.width, canvas.height);
+            
+            const base64Image = canvas.toDataURL('image/png').split(',')[1];
+
+            const prompt = "识别画面中人物身穿的衣服（上衣或最显眼的衣物）的主颜色。请只返回一个 JSON 对象，包含两个字段：'colorName' (中文颜色名称) 和 'hexCode' (对应的十六进制颜色代码，例如 #FF0000)。不要有其他文字。";
+
+            try {
+                const result = await fetchWithRetry(
+                    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`,
+                    {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            contents: [{
+                                parts: [
+                                    { text: prompt },
+                                    { inlineData: { mimeType: "image/png", data: base64Image } }
+                                ]
+                            }],
+                            generationConfig: {
+                                responseMimeType: "application/json",
+                                responseSchema: {
+                                    type: "OBJECT",
+                                    properties: {
+                                        colorName: { type: "STRING" },
+                                        hexCode: { type: "STRING" }
+                                    }
+                                }
+                            }
+                        })
+                    }
+                );
+
+                const data = JSON.parse(result.candidates[0].content.parts[0].text);
+                updateUI(data.colorName, data.hexCode);
+
+            } catch (err) {
+                console.error("Analysis failed:", err);
+            } finally {
+                loadingOverlay.classList.add('hidden');
+            }
+        }
+
+        // 更新界面颜色
+        function updateUI(name, hex) {
+            colorNameDisplay.textContent = name;
+            colorHexDisplay.textContent = hex;
+            
+            // 改变背景色
+            bodyBg.style.backgroundColor = hex;
+            
+            // 智能调整文字颜色（简单亮度计算）
+            const r = parseInt(hex.slice(1, 3), 16);
+            const g = parseInt(hex.slice(3, 5), 16);
+            const b = parseInt(hex.slice(5, 7), 16);
+            const brightness = (r * 299 + g * 587 + b * 114) / 1000;
+            
+            if (brightness > 125) {
+                bodyBg.classList.replace('text-white', 'text-gray-900');
+                colorHexDisplay.classList.replace('text-gray-300', 'text-gray-700');
+            } else {
+                bodyBg.classList.replace('text-gray-900', 'text-white');
+                colorHexDisplay.classList.replace('text-gray-700', 'text-gray-300');
+            }
+        }
+
+        // 控制开关
+        startBtn.addEventListener('click', async () => {
+            if (!isRunning) {
+                const hasCamera = await setupCamera();
+                if (hasCamera) {
+                    isRunning = true;
+                    startBtn.textContent = "停止识别";
+                    startBtn.classList.replace('bg-blue-600', 'bg-red-600');
+                    statusBadge.innerHTML = `<span class="w-2 h-2 bg-green-500 rounded-full mr-2 animate-pulse"></span> 正在实时监控`;
+                    statusBadge.classList.replace('text-red-400', 'text-green-400');
+                    statusBadge.classList.replace('bg-red-500/20', 'bg-green-500/20');
+                    
+                    // 立即执行一次，随后每 5 秒执行一次
+                    analyzeColor();
+                    analysisInterval = setInterval(analyzeColor, 5000);
+                }
+            } else {
+                isRunning = false;
+                clearInterval(analysisInterval);
+                startBtn.textContent = "开启摄像头与识别";
+                startBtn.classList.replace('bg-red-600', 'bg-blue-600');
+                statusBadge.innerHTML = `<span class="w-2 h-2 bg-red-500 rounded-full mr-2"></span> 已停止`;
+                statusBadge.classList.replace('text-green-400', 'text-red-400');
+                statusBadge.classList.replace('bg-green-500/20', 'bg-red-500/20');
+                
+                // 重置背景
+                bodyBg.style.backgroundColor = "";
+                bodyBg.classList.replace('text-gray-900', 'text-white');
+            }
+        });
+    </script>
+</body>
+</html>
